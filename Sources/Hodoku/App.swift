@@ -104,6 +104,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         toggleItem.keyEquivalentModifierMask = [.control, .option]
         toggleItem.target = self
         menu.addItem(toggleItem)
+        if !ScreenCapturer.hasPermission {
+            let open = NSMenuItem(title: "⚠︎ 画面収録が未許可 — システム設定を開く", action: #selector(openPrivacySettings), keyEquivalent: "")
+            open.target = self
+            menu.addItem(open)
+            let again = NSMenuItem(title: "許可したら: Hodoku を再起動", action: #selector(relaunch), keyEquivalent: "")
+            again.target = self
+            menu.addItem(again)
+        }
         menu.addItem(.separator())
         let s = learner.stats
         for line in [
@@ -134,6 +142,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func toggleFromMenu() { toggle() }
+
+    @objc private func openPrivacySettings() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+    }
+
+    @objc private func relaunch() {
+        let config = NSWorkspace.OpenConfiguration()
+        config.createsNewApplicationInstance = true
+        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: config) { _, _ in
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+        }
+    }
     @objc private func quit() {
         stop()
         NSApp.terminate(nil)
@@ -161,9 +181,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ScreenCapturer.requestPermission()
             let alert = NSAlert()
             alert.messageText = "画面収録の許可が必要です"
-            alert.informativeText = "システム設定 › プライバシーとセキュリティ › 画面収録とシステムオーディオ録音 で Hodoku を許可し、Hodoku を起動し直してください。画面の内容はこの Mac の中だけで処理されます。"
+            alert.informativeText = "1. 「システム設定を開く」を押し、一覧の Hodoku をオンにする\n2. もう一度 ⌃⌥R を押し、「Hodoku を再起動」を押す\n\n許可は再起動するまで反映されません。画面の内容はこの Mac の中だけで処理されます。"
+            alert.addButton(withTitle: "システム設定を開く")
+            alert.addButton(withTitle: "Hodoku を再起動")
+            alert.addButton(withTitle: "閉じる")
             NSApp.activate(ignoringOtherApps: true)
-            alert.runModal()
+            switch alert.runModal() {
+            case .alertFirstButtonReturn: openPrivacySettings()
+            case .alertSecondButtonReturn: relaunch()
+            default: break
+            }
             return
         }
         let mouse = NSEvent.mouseLocation
