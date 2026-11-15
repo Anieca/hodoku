@@ -7,6 +7,12 @@ final class OverlayView: NSView {
     var page: Page?
     var state = RenderState()
     var onClick: ((CGPoint, Bool) -> Void)?
+    /// ⌥ドラッグで語から語へなぞった（始点の語, 終点の語）
+    var onSelect: ((Int, Int) -> Void)?
+    var wordAt: ((CGPoint) -> Int?)?
+    /// 始点と今の位置から、選べる範囲の語を返す（選べなければ空）
+    var selectable: ((Int, Int) -> [Int])?
+    private var dragStart: Int?
 
     override var isFlipped: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -22,7 +28,32 @@ final class OverlayView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        onClick?(convert(event.locationInWindow, from: nil), event.modifierFlags.contains(.shift))
+        dragStart = wordAt?(convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let start = dragStart, !event.modifierFlags.contains(.shift),
+            let current = wordAt?(convert(event.locationInWindow, from: nil))
+        else { return }
+        let selection = current == start ? [] : (selectable?(start, current) ?? [])
+        if selection != state.selection {
+            state.selection = selection
+            needsDisplay = true
+        }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let end = wordAt?(point)
+        let start = dragStart
+        dragStart = nil
+        state.selection = []
+        needsDisplay = true
+        if let start, let end, start != end, !event.modifierFlags.contains(.shift) {
+            onSelect?(start, end)
+        } else {
+            onClick?(point, event.modifierFlags.contains(.shift))
+        }
     }
 }
 
@@ -115,7 +146,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         let s = learner.stats
         for line in [
-            "⌥クリック: 単語の意味を出す / もう知っている",
+            "⌥クリック: 単語・熟語の意味を出す / もう知っている",
+            "⌥ドラッグ: なぞった句（6 語まで）の意味を出す",
             "⌥⇧クリック: 文の構造（区切り → 主語・動詞 → 骨組み）",
             "—",
             String(format: "語彙レベル %.0f / 100", s.theta * 100),
@@ -206,6 +238,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         let view = OverlayView(frame: CGRect(origin: .zero, size: screen.frame.size))
         view.onClick = { [weak self] point, shift in self?.clicked(at: point, shift: shift) }
+        view.onSelect = { [weak self] a, b in self?.selected(from: a, to: b) }
+        view.wordAt = { [weak self] point in self?.session.wordIndex(at: point) }
+        view.selectable = { [weak self] a, b in self?.session.selection(from: a, to: b) ?? [] }
         panel.contentView = view
         panel.orderFrontRegardless()
         self.panel = panel
@@ -217,7 +252,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lastSignature = []
         needsRefresh = true
         lastChange = .distantPast
-        showMessage("Hodoku  ⌥クリック: 単語 ／ ⌥⇧クリック: 文の構造 ／ ⌃⌥R: 終了", seconds: 5)
+        showMessage("Hodoku  ⌥クリック: 単語・熟語 ／ ⌥ドラッグ: 句 ／ ⌥⇧クリック: 文の構造 ／ ⌃⌥R: 終了", seconds: 6)
 
         let gen = generation
         Task { @MainActor in
@@ -285,13 +320,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         needsRefresh = false
         let gen = generation
         let size = screen.frame.size
+        let customPhrases = learner.customPhrases
         let started = Date()
         lastRefresh = started
         Task { @MainActor in
             defer { analyzing = false }
             guard let image = try? await capturer.captureFull() else { return }
             let page = await withCheckedContinuation { (c: CheckedContinuation<Page, Never>) in
-                analysisQueue.async { c.resume(returning: Analyzer.analyze(image: image, viewSize: size)) }
+                analysisQueue.async { c.resume(returning: Analyzer.analyze(image: image, viewSize: size, customPhrases: customPhrases)) }
             }
             // 解析中に画面が動いていたら、この結果は捨てて次の読み直しに任せる。
             guard gen == generation, active else { return }
@@ -312,7 +348,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func redraw() {
         guard let view else { return }
+        view.page = session.page
         var state = session.renderState()
+        state.selection = view.state.selection
         state.optionHeld = view.state.optionHeld
         state.hover = view.state.hover
         state.message = Date() < messageUntil ? view.state.message : nil
@@ -348,10 +386,29 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if shift {
             session.cycleSentence(containing: index)
         } else {
-            session.toggleWord(index)
+            if let request = session.toggleWord(index) { ask(request) }
             if let page = session.page { refineSenses(for: page, generation: generation) }
         }
         redraw()
+    }
+
+    private func selected(from a: Int, to b: Int) {
+        if session.selection(from: a, to: b).isEmpty {
+            showMessage("句として選べるのは、同じ文の中の \(ReadingSession.maxPhraseWords) 語までです（全文訳は出しません）", seconds: 4)
+            return
+        }
+        if let request = session.selectPhrase(from: a, to: b) { ask(request) }
+        redraw()
+    }
+
+    /// 辞書にない語・自分で選んだ句の意味を、端末内モデルに聞く。
+    private func ask(_ request: MeaningRequest) {
+        Task { @MainActor in
+            let gloss = await refiner.meaning(of: request.phrase, in: request.sentence)
+            session.resolve(request, gloss: gloss)
+            if gloss == nil { showMessage("「\(request.phrase)」の意味は出せませんでした", seconds: 4) }
+            redraw()
+        }
     }
 
     /// 意味を出している多義語について、文脈に合う語義を選び直す（端末内モデル。失敗しても辞書の先頭の語義が出ている）。

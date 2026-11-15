@@ -15,6 +15,8 @@ private func DCSCopyRecordsForSearchString(
 private func DCSRecordCopyData(_ record: CFTypeRef, _ version: Int) -> Unmanaged<CFString>?
 @_silgen_name("DCSRecordGetHeadword")
 private func DCSRecordGetHeadword(_ record: CFTypeRef) -> Unmanaged<CFString>?
+@_silgen_name("DCSRecordGetAnchor")
+private func DCSRecordGetAnchor(_ record: CFTypeRef) -> Unmanaged<CFString>?
 
 struct Sense {
     let pos: String  // 「動詞」「名詞」など（辞書の表記のまま）
@@ -27,8 +29,16 @@ struct DictEntry {
     let senses: [Sense]
 }
 
+struct IdiomEntry {
+    /// 辞書の見出し（"come up with A" など）
+    let headword: String
+    let gloss: String
+    let difficulty: Double
+}
+
 final class EJDictionary {
     static let shared = EJDictionary()
+    private var idiomCache: [String: IdiomEntry?] = [:]
 
     private let dict: DCSDictionary?
     private var cache: [String: DictEntry?] = [:]
@@ -73,11 +83,13 @@ final class EJDictionary {
         var best: (html: String, rank: Int)?
         var maxSize = 0
         for record in records {
-            let headword = ((DCSRecordGetHeadword(record)?.takeUnretainedValue() as String?) ?? "").lowercased()
+            let headword = (DCSRecordGetHeadword(record)?.takeUnretainedValue() as String?) ?? ""
             let html = (DCSRecordCopyData(record, 0)?.takeRetainedValue() as String?) ?? ""
             maxSize = max(maxSize, html.utf8.count)
-            // 見出し語が原形に一致するものを優先し、次に表記そのもの、最後に先頭の候補。
-            let rank = headword == lemma ? 0 : (headword == word ? 1 : 2)
+            // 見出し語が原形に一致するものを優先し、次に表記そのもの。
+            // 大文字小文字だけが違う見出し（swift に対する人名 Swift）は後回し。
+            let rank: Int
+            if headword == lemma { rank = 0 } else if headword == word { rank = 1 } else if headword.lowercased() == word.lowercased() { rank = 3 } else { rank = 2 }
             if best == nil || rank < best!.rank { best = (html, rank) }
         }
         guard let best, maxSize > 0 else { return nil }
@@ -122,6 +134,54 @@ final class EJDictionary {
             out.append(String(word.dropFirst(prefix.count)))
         }
         return out
+    }
+
+    // MARK: - 熟語
+
+    /// 辞書の成句見出し（"in terms of A", "take place" など）をそのままの形で引く。
+    func idiom(_ query: String) -> IdiomEntry? {
+        lock.lock()
+        if let hit = idiomCache[query] {
+            lock.unlock()
+            return hit
+        }
+        lock.unlock()
+        var result: IdiomEntry?
+        if let dict,
+            let records = DCSCopyRecordsForSearchString(dict, query as CFString, nil, nil)?
+                .takeRetainedValue() as? [AnyObject]
+        {
+            for record in records {
+                let headword = (DCSRecordGetHeadword(record)?.takeUnretainedValue() as String?) ?? ""
+                // 見出しの A は目的語の位置を表す記号。本文の冠詞 a と取り違えないよう、大文字小文字を区別して比べる。
+                guard headword == query,
+                    let anchor = DCSRecordGetAnchor(record)?.takeUnretainedValue() as String?,
+                    let idStart = anchor.range(of: "@id='"), let idEnd = anchor.range(of: "'", range: idStart.upperBound..<anchor.endIndex)
+                else { continue }
+                let id = String(anchor[idStart.upperBound..<idEnd.lowerBound])
+                let html = ((DCSRecordCopyData(record, 0)?.takeRetainedValue() as String?) ?? "") as NSString
+                // 親見出しの項目の中から、この成句の節だけを取り出す。
+                let at = html.range(of: "id=\"\(id)\"")
+                guard at.location != NSNotFound else { continue }
+                let close = html.range(of: ">", range: NSRange(location: at.location, length: html.length - at.location))
+                guard close.location != NSNotFound else { continue }
+                let section = Self.innerHTML(html, from: close.location + 1)
+                if let sense = Self.parseSenses(section).first {
+                    result = IdiomEntry(headword: headword, gloss: sense.gloss, difficulty: Self.idiomDifficulty(sectionSize: section.utf8.count))
+                    break
+                }
+            }
+        }
+        lock.lock()
+        idiomCache[query] = result
+        lock.unlock()
+        return result
+    }
+
+    /// 成句も、よく使うものほど用例つきで記述が長い。
+    static func idiomDifficulty(sectionSize: Int) -> Double {
+        let hi = log(6_000.0), lo = log(350.0)
+        return min(1, max(0.3, (hi - log(Double(max(sectionSize, 1)))) / (hi - lo)))
     }
 
     /// よく使う語ほど辞書の記述が長い（the: 110KB, important: 15KB, mitigate: 1.5KB）。
@@ -188,7 +248,7 @@ final class EJDictionary {
         pattern: #"<span[^>]*class="(xrg|pr|oup_label|lbl|grnote)[^"]*"[^>]*>"#)
     private static let tag = try! NSRegularExpression(pattern: "<[^>]+>")
     private static let brackets = try! NSRegularExpression(
-        pattern: #"〈[^〉]*〉|｟[^｠]*｠|【[^】]*】|《[^》]*》|\([^)]*\)|（[^）]*）|\[[^\]]*\]|〖[^〗]*〗"#)
+        pattern: #"〈[^〉]*〉|«[^»]*»|〘[^〙]*〙|｟[^｠]*｠|【[^】]*】|《[^》]*》|\([^)]*\)|（[^）]*）|\[[^\]]*\]|〖[^〗]*〗"#)
 
     static func cleanGloss(_ innerHTML: String) -> String {
         var s = innerHTML
@@ -217,7 +277,12 @@ final class EJDictionary {
         guard let first = parts.first else { return "" }
         var out = first
         if parts.count > 1, first.count + parts[1].count <= 11 { out += "、" + parts[1] }
+        // 辞書は目的語や補語の位置を A・B・C で書く。記号のままでは読みにくいので 〜 にする。
+        out = placeholder.stringByReplacingMatches(in: out, range: NSRange(location: 0, length: (out as NSString).length), withTemplate: "〜")
         if out.count > 14 { out = String(out.prefix(13)) + "…" }
         return out
     }
+
+    private static let placeholder = try! NSRegularExpression(pattern: "(?<![A-Za-z])[ABC](?![A-Za-z])")
+
 }

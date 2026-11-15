@@ -39,6 +39,17 @@ if let input = value("--image"), let out = value("--out") {
     exit(0)
 }
 
+if let q = value("--idiom") {
+    for query in q.split(separator: ",").map(String.init) {
+        if let e = EJDictionary.shared.idiom(query) {
+            print(String(format: "%.2f  %@ → %@", e.difficulty, e.headword, e.gloss))
+        } else {
+            print(" -    \(query)")
+        }
+    }
+    exit(0)
+}
+
 if args.contains("--selftest") {
     CLI.selfTest()
     exit(0)

@@ -8,10 +8,12 @@ enum CLI {
         The extent to which models trained on data scraped from the public internet can be said to understand the text they produce remains a matter that researchers who study language have debated without reaching anything resembling consensus.
 
         The cat sat on the mat. Central banks around the world have struggled to bring inflation back to their targets without tipping their economies into recession, a balancing act that has become harder as energy prices have risen again. Critics argue the policy is perfunctory and will exacerbate the problem.
+
+        By and large, the team came up with a plan that takes the cost into account. We need to refactor the module on Kubernetes before we run out of time, and many developers rely on it.
         """
 
     static func writeSample(to path: String) {
-        let size = CGSize(width: 900, height: 560)
+        let size = CGSize(width: 900, height: 660)
         let rep = bitmap(size: size, scale: 2)
         let ctx = NSGraphicsContext(bitmapImageRep: rep)!
         NSGraphicsContext.current = ctx
@@ -53,6 +55,13 @@ enum CLI {
         var render = session.renderState()
         if let level {
             for (i, s) in page.sentences.enumerated() where s.words.count >= 12 { render.sentenceLevel[i] = level }
+        }
+        for phrase in render.phrases {
+            let text = phrase.words.map { page.words[$0].text }.joined(separator: " ")
+            print("  \(phrase.display == .hint ? "…" : "＋") [句] \(text) → \(phrase.gloss)")
+        }
+        for phrase in page.phrases where !render.phrases.contains(where: { $0.words == phrase.words }) {
+            print(String(format: "  － [句 %.2f] %@ → %@", phrase.difficulty ?? 0, phrase.key, phrase.gloss))
         }
         for (i, entry) in render.words.sorted(by: { $0.key < $1.key }) {
             let w = page.words[i]
@@ -155,10 +164,10 @@ enum CLI {
             {
                 check("画像から読んだ難しい語に意味が出る", session.renderState().words[hard]?.display == .gloss)
                 check("位置から語が引ける", session.wordIndex(at: CGPoint(x: page.words[hard].rect.midX, y: page.words[hard].rect.midY)) == hard)
-                session.toggleWord(hard)
+                _ = session.toggleWord(hard)
                 check("意味の出ている語を⌥クリック → 消える", session.renderState().words[hard] == nil)
                 check("何も出ていない語は表示なし", session.renderState().words[easy] == nil)
-                session.toggleWord(easy)
+                _ = session.toggleWord(easy)
                 check("何も出ていない語を⌥クリック → 意味が出る", session.renderState().words[easy]?.display == .gloss)
                 let long = page.words[easy].sentence, brief = page.words[short].sentence
                 check("長い文は自動で区切る", session.renderState().sentenceLevel[long] == 1)
@@ -168,10 +177,52 @@ enum CLI {
                 session.cycleSentence(containing: easy)
                 session.cycleSentence(containing: easy)
                 check("3 段の次は助けなしに戻る", session.renderState().sentenceLevel[long] == nil)
+
+                // 熟語・句・辞書にない語
+                func phraseGloss(_ text: String) -> String? {
+                    session.renderState().phrases.first { $0.words.map { session.page!.words[$0].text }.joined(separator: " ") == text }?.gloss
+                }
+                check("難しめの熟語は自動で句として出る", phraseGloss("By and large") != nil)
+                check("易しい熟語は自動では出ない", phraseGloss("came up with") == nil)
+                if let came = page.words.firstIndex(where: { $0.text == "came" }) {
+                    _ = session.toggleWord(came)
+                    check("熟語の中の語を⌥クリック → 熟語として出る", phraseGloss("came up with")?.contains("思いつく") == true)
+                    _ = session.toggleWord(came)
+                    check("もう一度⌥クリック → 熟語をやめて語の意味を出す", phraseGloss("came up with") == nil && session.renderState().words[came]?.display == .gloss)
+                }
+                if let word = page.words.firstIndex(where: { $0.text == "refactor" }) {
+                    let request = session.toggleWord(word)
+                    check("辞書にない語は端末内モデルに聞く", request?.phrase == "refactor")
+                    check("答えを待つ間は … を出す", session.renderState().words[word]?.gloss == "…")
+                    if let request { session.resolve(request, gloss: "作り直す") }
+                    check("モデルの答えは ≈ 付きで出る", session.renderState().words[word]?.gloss == "≈作り直す")
+                }
+                if let a = page.words.firstIndex(where: { $0.text == "takes" }), let b = page.words.firstIndex(where: { $0.text == "account" }) {
+                    check("文をまたぐ・長すぎる範囲は選べない", session.selection(from: 0, to: b).isEmpty)
+                    let request = session.selectPhrase(from: a, to: b)
+                    check("なぞった句を端末内モデルに聞く", request?.phrase == "takes the cost into account")
+                    if let request { session.resolve(request, gloss: "費用を考慮する") }
+                    check("句の意味が句の単位で出る", phraseGloss("takes the cost into account") == "≈費用を考慮する")
+                    let again = Analyzer.analyze(image: image, viewSize: page.size, customPhrases: fresh.customPhrases)
+                    check("次に同じ句に出会ったら、頼まなくても句として出る", again.phrases.contains { $0.key == "takes the cost into account" })
+                }
+                if let kube = page.words.firstIndex(where: { $0.text == "Kubernetes" }) {
+                    check("固有名詞には自動では出さないが、頼めば聞ける", session.renderState().words[kube] == nil && session.toggleWord(kube) != nil)
+                }
             } else {
                 check("確認用の画像から語を読み取れる", false)
             }
         }
+
+        // 端末内モデルが実際に答えるか（内容は問わない）
+        let done = DispatchSemaphore(value: 0)
+        var answer: String?
+        Task {
+            answer = await SenseRefiner().meaning(of: "refactor", in: "We need to refactor the payment module before adding new features.")
+            done.signal()
+        }
+        check("端末内モデルが語句の意味を返す（20 秒以内）", done.wait(timeout: .now() + 20) == .success && answer != nil)
+        print("        refactor → \(answer ?? "-")")
 
         check("記録がファイルから復元できる", Learner(url: url).data.words["merger"]?.known == true)
         print(failures == 0 ? "すべて通過" : "\(failures) 件失敗")

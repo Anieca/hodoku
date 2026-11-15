@@ -6,6 +6,15 @@ struct RenderState {
     var words: [Int: (display: WordDisplay, gloss: String)] = [:]
     /// 文の添字 → 助けの段階（1: 区切り / 2: +主語・動詞 / 3: +修飾部を薄く）
     var sentenceLevel: [Int: Int] = [:]
+    struct PhraseItem {
+        var words: [Int]
+        var display: WordDisplay
+        var gloss: String
+    }
+    /// 熟語や、使う人が選んだ句
+    var phrases: [PhraseItem] = []
+    /// ⌥ドラッグで選んでいる途中の語
+    var selection: [Int] = []
     var hover: Int?
     var optionHeld = false
     var message: String?
@@ -25,7 +34,12 @@ enum Renderer {
         }
         drawWords(page: page, state: state, bounds: bounds)
 
-        if let h = state.hover, h < page.words.count {
+        if !state.selection.isEmpty {
+            NSColor.systemBlue.withAlphaComponent(0.22).setFill()
+            for index in state.selection where index < page.words.count {
+                NSBezierPath(roundedRect: page.words[index].rect.insetBy(dx: -3, dy: -2), xRadius: 3, yRadius: 3).fill()
+            }
+        } else if let h = state.hover, h < page.words.count {
             let r = page.words[h].rect.insetBy(dx: -3, dy: -2)
             let path = NSBezierPath(roundedRect: r, xRadius: 4, yRadius: 4)
             path.lineWidth = 1.5
@@ -42,32 +56,54 @@ enum Renderer {
     // MARK: - 単語
 
     private static func drawWords(page: Page, state: RenderState, bounds: CGRect) {
-        var pills: [(rect: CGRect, text: NSAttributedString, bg: NSColor)] = []
+        // 語も句も「いくつかの語にまたがる 1 つの注釈」として同じように描く。
+        var items: [(words: [Int], display: WordDisplay, gloss: String)] = []
         for (i, entry) in state.words.sorted(by: { $0.key < $1.key }) where i < page.words.count {
-            let word = page.words[i]
-            let dark = isDark(word.bg)
+            items.append(([i], entry.display, entry.gloss))
+        }
+        for phrase in state.phrases where phrase.words.allSatisfy({ $0 < page.words.count }) && !phrase.words.isEmpty {
+            items.append((phrase.words, phrase.display, phrase.gloss))
+        }
+
+        var pills: [(rect: CGRect, text: NSAttributedString, bg: NSColor)] = []
+        for item in items {
+            let first = page.words[item.words[0]]
+            let dark = isDark(first.bg)
             let color = dark ? NSColor(srgbRed: 1.0, green: 0.74, blue: 0.42, alpha: 1) : NSColor(srgbRed: 0.72, green: 0.16, blue: 0.10, alpha: 1)
 
-            // 下線（意味を出している語は実線、思い出す練習中の語は点線）
-            let line = NSBezierPath()
-            let y = word.rect.maxY + 1.5
-            line.move(to: CGPoint(x: word.rect.minX, y: y))
-            line.line(to: CGPoint(x: word.rect.maxX, y: y))
-            line.lineWidth = 1.2
-            if entry.display == .hint { line.setLineDash([2, 2.5], count: 2, phase: 0) }
-            color.withAlphaComponent(entry.display == .hint ? 0.9 : 0.55).setStroke()
-            line.stroke()
+            // 下線（意味を出しているものは実線、思い出す練習中のものは点線）。句は隣り合う語をつなげて引く。
+            color.withAlphaComponent(item.display == .hint ? 0.9 : 0.55).setStroke()
+            for (k, index) in item.words.enumerated() {
+                let rect = page.words[index].rect
+                var from = rect.minX
+                if k > 0, item.words[k - 1] == index - 1 {
+                    let prev = page.words[index - 1].rect
+                    if abs(prev.midY - rect.midY) < rect.height * 0.5 { from = prev.maxX }
+                }
+                let line = NSBezierPath()
+                let y = rect.maxY + 1.5
+                line.move(to: CGPoint(x: from, y: y))
+                line.line(to: CGPoint(x: rect.maxX, y: y))
+                line.lineWidth = item.words.count > 1 ? 1.6 : 1.2
+                if item.display == .hint { line.setLineDash([2, 2.5], count: 2, phase: 0) }
+                line.stroke()
+            }
 
-            guard entry.display == .gloss, !entry.gloss.isEmpty else { continue }
-            let fontSize = min(13, max(9, word.rect.height * 0.55))
+            guard item.display == .gloss, !item.gloss.isEmpty else { continue }
+            let fontSize = min(13, max(9, first.rect.height * 0.55))
             let text = NSAttributedString(
-                string: entry.gloss,
+                string: item.gloss,
                 attributes: [.font: NSFont.systemFont(ofSize: fontSize, weight: .medium), .foregroundColor: color])
             let size = text.size()
             let w = size.width + 6, h = size.height + 1
-            // 語のすぐ上、行間に置く。
-            let rect = CGRect(x: word.rect.midX - w / 2, y: word.rect.minY - h + 1, width: w, height: h)
-            pills.append((rect, text, word.bg))
+            // 語（句なら最初の行にある部分）のすぐ上、行間に置く。
+            var span = first.rect
+            for index in item.words.dropFirst() {
+                let r = page.words[index].rect
+                if abs(r.midY - first.rect.midY) < first.rect.height * 0.5 { span = span.union(r) }
+            }
+            let rect = CGRect(x: span.midX - w / 2, y: span.minY - h + 1, width: w, height: h)
+            pills.append((rect, text, first.bg))
         }
 
         // 同じ行で重なるものは右へずらす。

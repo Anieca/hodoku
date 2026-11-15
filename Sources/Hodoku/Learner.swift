@@ -14,6 +14,8 @@ final class Learner {
         var strength = 0
         var shows = 0
         var lastCredit: Date?
+        /// 辞書にない語や自分で選んだ句について、端末内モデルが出した意味
+        var gloss: String?
     }
 
     struct Data: Codable {
@@ -75,12 +77,31 @@ final class Learner {
         1 / (1 + exp(-(data.theta - difficulty) / 0.08))
     }
 
-    func display(key: String, difficulty: Double) -> WordDisplay {
+    /// difficulty が nil のもの（固有名詞・辞書にない語・自分で選んだ句）は、頼まれたときだけ助ける。
+    func display(key: String, difficulty: Double?) -> WordDisplay {
         if let s = data.words[key] {
             if s.known { return .none }
             return s.strength == 0 ? .gloss : .hint
         }
+        guard let difficulty else { return .none }
         return difficulty > data.theta ? .gloss : .none
+    }
+
+    func customGloss(_ key: String) -> String? { data.words[key]?.gloss }
+
+    /// 記録を取り消す（熟語として開いたが、知りたかったのは語のほうだった、というとき）。
+    func forget(key: String) {
+        data.words[key] = nil
+        save()
+    }
+
+    /// 自分で選んで覚えている最中の句（"rely on" など）。次に出会ったときも句として助ける。
+    var customPhrases: [String: String] {
+        var out: [String: String] = [:]
+        for (key, state) in data.words where key.contains(" ") {
+            if let gloss = state.gloss { out[key] = gloss }
+        }
+        return out
     }
 
     /// はっきりした反応（クリック）があったときだけ語彙レベルを大きく動かす。使い始めほど大きく。
@@ -92,25 +113,26 @@ final class Learner {
     }
 
     /// 助けが出ていなかった語を ⌥クリックした＝知らなかった。
-    func markUnknown(key: String, difficulty: Double) {
+    func markUnknown(key: String, difficulty: Double?, gloss: String? = nil, weight: Double = 1) {
         let wasPredictedKnown = display(key: key, difficulty: difficulty) == .none
         var s = data.words[key] ?? WordState()
         s.known = false
         s.strength = 0
         s.shows = 0
+        if let gloss { s.gloss = gloss }
         data.words[key] = s
-        if wasPredictedKnown { observe(known: false, difficulty: difficulty) }
+        if wasPredictedKnown, let difficulty { observe(known: false, difficulty: difficulty, weight: weight) }
         save()
     }
 
     /// 意味が出ている語を ⌥クリックした＝もう知っている。
-    func markKnown(key: String, difficulty: Double) {
+    func markKnown(key: String, difficulty: Double?, weight: Double = 1) {
         var s = data.words[key] ?? WordState()
         let fresh = data.words[key] == nil
         s.known = true
         s.strength = Self.graduateStrength
         data.words[key] = s
-        observe(known: true, difficulty: difficulty, weight: fresh ? 1 : 0.5)
+        if let difficulty { observe(known: true, difficulty: difficulty, weight: (fresh ? 1 : 0.5) * weight) }
         save()
     }
 
@@ -127,7 +149,7 @@ final class Learner {
     /// しばらく表示されていたページを読み終えたとみなして進める。
     /// - 意味を見せた語: 2 回見せたら次からは下線だけにする。
     /// - 下線だけで済んだ語: 間隔を空けて 2 回続けば卒業（助けを出さない）。
-    func credit(glossed: [String], hintsHeld: [(key: String, difficulty: Double)], autoSentences: [String]) {
+    func credit(glossed: [String], hintsHeld: [(key: String, difficulty: Double?)], autoSentences: [String]) {
         let now = Date()
         func due(_ s: WordState) -> Bool {
             s.lastCredit.map { now.timeIntervalSince($0) >= Self.creditInterval } ?? true
@@ -147,7 +169,7 @@ final class Learner {
             s.lastCredit = now
             if s.strength >= Self.graduateStrength {
                 s.known = true
-                observe(known: true, difficulty: difficulty, weight: 0.4)
+                if let difficulty { observe(known: true, difficulty: difficulty, weight: 0.4) }
             }
             data.words[key] = s
         }

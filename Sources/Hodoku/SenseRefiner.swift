@@ -11,6 +11,33 @@ struct SensePick {
 /// 候補は辞書の語義だけで、モデルに訳を作らせることはしない。使えないときは辞書の先頭の語義のまま。
 actor SenseRefiner {
     private var cache: [String: Int] = [:]
+    private var meanings: [String: String] = [:]
+
+    /// 辞書にない語や、使う人が選んだ句の、その文での意味を短い日本語で返す。
+    /// 語句だけを渡して語句の意味だけを受け取る（文全体の訳は作らせない）。
+    func meaning(of phrase: String, in sentence: String) async -> String? {
+        guard isAvailable else { return nil }
+        let key = phrase + "|" + sentence
+        if let hit = meanings[key] { return hit }
+        let session = LanguageModelSession(
+            model: SystemLanguageModel(guardrails: .permissiveContentTransformations),
+            instructions: "You are an English-Japanese dictionary. Reply with only the Japanese meaning of the phrase as used in the sentence: a few words, no explanation, no English.")
+        do {
+            // 文字列の構造化出力は止まらずに生成し続けることがあったので、素の応答を短く打ち切る。
+            let raw = try await session.respond(
+                to: "Sentence: \(sentence)\nPhrase: \(phrase)\nJapanese meaning:",
+                options: GenerationOptions(temperature: 0, maximumResponseTokens: 24)
+            ).content
+            var text = (raw.split(whereSeparator: \.isNewline).first.map(String.init) ?? "")
+                .trimmingCharacters(in: CharacterSet(charactersIn: " 　「」\"'。.、"))
+            guard !text.isEmpty else { return nil }
+            if text.count > 18 { text = String(text.prefix(17)) + "…" }
+            meanings[key] = text
+            return text
+        } catch {
+            return nil
+        }
+    }
 
     var isAvailable: Bool {
         if case .available = SystemLanguageModel.default.availability { return true }
