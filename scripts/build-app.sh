@@ -24,8 +24,18 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
-# 署名用の証明書がなければアドホック署名。この場合、ビルドし直すたびに画面収録の許可を取り直す必要がある。
-codesign --force --sign "${HODOKU_SIGN_IDENTITY:--}" "$APP"
+# 署名。アドホック署名だとビルドのたびにアプリが別物とみなされ、画面収録の許可を取り直すことになる。
+# ログインキーチェーンに "Hodoku Local Signing" があればそれを使う（scripts/make-signing-cert.sh で作れる）。
+IDENTITY="${HODOKU_SIGN_IDENTITY:-}"
+if [[ -z "$IDENTITY" ]]; then
+    if security find-certificate -c "Hodoku Local Signing" >/dev/null 2>&1; then
+        IDENTITY="Hodoku Local Signing"
+    else
+        IDENTITY="-"
+    fi
+fi
+codesign --force --sign "$IDENTITY" "$APP"
+echo "signed with: $IDENTITY"
 
 if [[ "${1:-}" == "--install" ]]; then
     pkill -x Hodoku 2>/dev/null || true
